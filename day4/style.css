@@ -1,0 +1,136 @@
+:root {
+  color-scheme: light;
+  --page-bg: #f1f5f9;
+  --surface-bg: #ffffff;
+  --text-color: #172033;
+  --muted-color: #475569;
+  --border-color: #64748b;
+  --button-bg: #174ea6;
+  --button-text: #ffffff;
+  --button-hover: #103b80;
+  --warning-color: #a34700;
+  --over-color: #b91c1c;
+}
+
+body.dark {
+  color-scheme: dark;
+  --page-bg: #111827;
+  --surface-bg: #1f2937;
+  --text-color: #f8fafc;
+  --muted-color: #cbd5e1;
+  --border-color: #94a3b8;
+  --button-bg: #93c5fd;
+  --button-text: #111827;
+  --button-hover: #bfdbfe;
+  --warning-color: #ffb454;
+  --over-color: #ff8585;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background-color: var(--page-bg);
+  color: var(--text-color);
+  font-family: Arial, sans-serif;
+  line-height: 1.6;
+}
+
+header,
+main,
+footer {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+h1,
+h2 {
+  line-height: 1.25;
+}
+
+section {
+  background-color: var(--surface-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 24px;
+}
+
+label {
+  display: block;
+  font-weight: bold;
+  margin-bottom: 8px;
+}
+
+textarea {
+  display: block;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background-color: var(--page-bg);
+  color: var(--text-color);
+  font: inherit;
+  resize: vertical;
+}
+
+#draft-help,
+footer {
+  color: var(--muted-color);
+}
+
+.counters {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+}
+
+button {
+  background-color: var(--button-bg);
+  color: var(--button-text);
+  border: 0;
+  border-radius: 6px;
+  padding: 10px 18px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover {
+  background-color: var(--button-hover);
+}
+
+button:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid var(--button-bg);
+  outline-offset: 3px;
+}
+
+.warning {
+  color: var(--warning-color);
+}
+
+.over {
+  color: var(--over-color);
+  font-weight: bold;
+}
+
+@media (max-width: 600px) {
+  header,
+  main,
+  footer {
+    padding: 16px;
+  }
+
+  section {
+    padding: 16px;
+  }
+
+  .counters {
+    flex-direction: column;
+    gap: 0;
+  }
+}

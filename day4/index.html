@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QuickNotes — Draft Counter</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="script.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <h1>QuickNotes Draft Counter</h1>
+      <p>Write a draft, check its length and choose your theme.</p>
+      <button id="theme-toggle" type="button" aria-pressed="false">
+        Dark mode
+      </button>
+    </header>
+
+    <main>
+      <section aria-labelledby="draft-heading">
+        <h2 id="draft-heading">Your draft</h2>
+
+        <label for="note-text">Note text</label>
+        <textarea
+          id="note-text"
+          rows="8"
+          placeholder="Start writing your note..."
+          aria-describedby="draft-help char-count word-count"
+        ></textarea>
+
+        <p id="draft-help">
+          Aim for 200 characters or fewer. Your draft saves automatically.
+          Press Escape inside the text box to clear it.
+        </p>
+
+        <div class="counters" aria-live="polite">
+          <p id="char-count">0 / 200 characters</p>
+          <p id="word-count">0 words</p>
+        </div>
+
+        <button id="clear-btn" type="button">Clear</button>
+      </section>
+    </main>
+
+    <footer>
+      <p>&copy; 2026 Aden. PLP Day 4 assignment.</p>
+    </footer>
+  </body>
+</html>
