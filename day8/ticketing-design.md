@@ -1,6 +1,8 @@
 # TicketHub: Event Ticketing System Design
 
-TicketHub helps people discover concerts, choose seats and buy tickets online. This design follows the course's six-part framework. Its main challenge is selling a limited number of seats fairly when many people arrive together.
+TicketHub lets customers discover events, reserve assigned seats and pay online. The main challenge is selling limited inventory fairly during a sudden rush.
+
+**Review map:** 1. Requirements; 2. Scale estimates; 3. API; 4. SQL data model and double-booking transactions; 5. Architecture; 6. Bottlenecks and trade-offs. All six sections are contained in this file.
 
 ## 1. Clarify requirements
 
@@ -59,155 +61,247 @@ Assume 1 KB per user: 2,000,000 × 1 KB ≈ **2 GB**. Assume an average of 2 KB 
 
 ## 3. Design the API
 
-All endpoints use `/api/v1`. Checkout and personal-ticket endpoints require authentication. The server derives user identity from the session, never from a client-supplied user ID. Lists use cursor pagination.
+Base path: `/api/v1`. Authentication is required for checkout and personal records. Identity comes from the session, not a client-supplied user ID. Lists use cursor pagination.
 
-| Method and endpoint | Purpose and example | Main responses |
+| Method and path | Purpose | Responses |
 | --- | --- | --- |
-| `GET /events?city=Nairobi&cursor=...` | Browse events; returns `{"items":[{"id":42,"title":"Nairobi Live"}],"nextCursor":null}`. | `200 OK`, `400 Bad Request` |
-| `GET /events/42` | View venue, date, sale time and price information. | `200 OK`, `404 Not Found` |
-| `GET /events/42/seats?section=A` | View seat IDs, prices and displayed availability for one section, with an `asOf` timestamp. | `200 OK`, `404 Not Found` |
-| `POST /events/42/queue-entries` | Join the waiting room; repeated joins by the same account return the existing entry. | `201 Created`, `200 OK` for an existing entry, `429 Too Many Requests` |
-| `GET /queue-entries/q123` | View own queue status and receive an admission token when admitted. | `200 OK`, `403 Forbidden`, `404 Not Found` |
-| `POST /holds` | Body `{"eventId":42,"seatIds":[101,102]}` plus admission token during a big sale and an `Idempotency-Key` header. Creates a held order. | `201 Created`, `409 Conflict` if a seat is unavailable, `422 Unprocessable Content` for invalid seat selection, `429 Too Many Requests` |
-| `DELETE /holds/o123` | Release an owned hold before payment begins; repeated release is harmless. | `204 No Content`, `409 Conflict` if already paying or paid |
-| `POST /orders/o123/payments` | Start payment for the held order using an `Idempotency-Key`. The server calculates the total and returns a provider checkout URL. | `202 Accepted`, `409 Conflict` if expired or ineligible |
-| `GET /orders/o123` | View own order, payment state and total. | `200 OK`, `404 Not Found` |
-| `GET /me/tickets?cursor=...` | View confirmed tickets belonging to the signed-in user. | `200 OK`, `401 Unauthorized` |
-| `POST /webhooks/payments` | Provider-only signed notification; deduplicate by provider event ID and verify amount, currency and order reference. | `200 OK` after durable handling, `400 Bad Request` for invalid payload/signature, `503 Service Unavailable` for a retryable storage failure |
+| `GET /events?city=Nairobi` | Browse/search events. | `200`, `400` |
+| `GET /events/42` | Event details, date and prices. | `200`, `404` |
+| `GET /events/42/seats?section=A` | Section seat map with an `asOf` timestamp. | `200`, `404` |
+| `POST /events/42/queue-entries` | Join waiting room; reuse an existing account entry. | `201`, `200`, `429` |
+| `GET /queue-entries/q123` | Own queue status/admission token. | `200`, `403`, `404` |
+| `POST /holds` | Atomically hold selected seats. | `201`, `409`, `422`, `429` |
+| `DELETE /holds/o123` | Release an owned hold before payment. | `204`, `409` |
+| `POST /orders/o123/payments` | Start payment; return processing state or provider checkout URL. | `202`, `409` |
+| `GET /orders/o123` | Own order/payment status. | `200`, `404` |
+| `GET /me/tickets` | Own confirmed tickets. | `200`, `401` |
+| `POST /webhooks/payments` | Signed provider confirmation. | `200`, `400`, `503` |
 
-Example hold response:
+Example hold request:
 
-```json
-{
-  "orderId": "o123",
-  "status": "held",
-  "seatIds": [101, 102],
-  "totalMinor": 600000,
-  "currency": "KES",
-  "expiresAt": "2026-11-01T10:05:00Z"
-}
+```http
+POST /api/v1/holds
+Authorization: Bearer <session-token>
+Idempotency-Key: hold-request-123
+X-Admission-Token: <signed-event-token>
+Content-Type: application/json
+
+{"eventId":42,"seatIds":[101,102]}
 ```
 
-Amounts use integer minor units: 600000 means KES 6,000.00. An unavailable seat returns a clear error such as `{"error":"SEAT_UNAVAILABLE","seatIds":[101]}`. A successful repeat with the same idempotency key returns the original result; a different payload using that key returns `409`. Other users' private orders return `404` to avoid exposing their existence. Temporary overload returns `429` with `Retry-After`; inventory outages return `503`.
+Example `201 Created` response, with `Location: /api/v1/orders/o123`:
+
+```json
+{"orderId":"o123","status":"held","seatIds":[101,102],"totalMinor":600000,"currency":"KES","expiresAt":"2026-11-01T10:05:00Z"}
+```
+
+`600000` minor units means KES 6,000.00. The server calculates prices. A lost response can be retried: the same user/key/payload returns the original result; a changed payload with that key returns `409`. Store the request hash with the order. Payment requests also require an idempotency key.
+
+Unavailable seats return `409` with `{"error":"SEAT_UNAVAILABLE","seatIds":[101]}`. Invalid selections return `422`; unauthenticated protected requests return `401`; private records belonging to others return `404`. Overload returns `429` with `Retry-After`. An unavailable inventory writer returns `503`. Webhooks return success only after durable processing; verify their signatures, order reference, amount and currency.
 
 ## 4. Design the data model and prevent double-booking
 
-Use PostgreSQL because the data has clear relationships and booking requires atomic transactions. An atomic transaction either commits every change or rolls them all back.
+### PostgreSQL schema
 
-### Tables
+Each seat belongs to one event performance, rather than being a reusable venue seat. Orders contain one to four seats. UUID values are generated by the application; money uses integer minor units.
 
-| Table | Main columns and constraints |
-| --- | --- |
-| `users` | `id UUID PRIMARY KEY`, `name TEXT NOT NULL`, `email TEXT UNIQUE NOT NULL`, `password_hash TEXT NOT NULL`, `created_at TIMESTAMPTZ NOT NULL` |
-| `events` | `id BIGINT PRIMARY KEY`, `title TEXT NOT NULL`, `venue TEXT NOT NULL`, `starts_at TIMESTAMPTZ NOT NULL`, `sale_starts_at TIMESTAMPTZ NOT NULL`, `poster_url TEXT` |
-| `orders` | `id UUID PRIMARY KEY`, `user_id UUID REFERENCES users(id)`, `event_id BIGINT REFERENCES events(id)`, `status TEXT NOT NULL`, `expires_at TIMESTAMPTZ`, `total_minor BIGINT CHECK (total_minor >= 0)`, `currency CHAR(3) NOT NULL`, `request_key TEXT NOT NULL`, `request_hash TEXT NOT NULL`, `created_at TIMESTAMPTZ NOT NULL`, `UNIQUE(user_id, request_key)` |
-| `seats` | `id BIGINT PRIMARY KEY`, `event_id BIGINT REFERENCES events(id)`, `section TEXT NOT NULL`, `row_label TEXT NOT NULL`, `seat_number INTEGER NOT NULL`, `price_minor BIGINT CHECK (price_minor >= 0)`, `state TEXT NOT NULL`, `allocation_order_id UUID REFERENCES orders(id)`, `UNIQUE(event_id, section, row_label, seat_number)` |
-| `payments` | `id UUID PRIMARY KEY`, `order_id UUID UNIQUE REFERENCES orders(id)`, `provider_reference TEXT UNIQUE`, `idempotency_key TEXT UNIQUE NOT NULL`, `amount_minor BIGINT NOT NULL`, `currency CHAR(3) NOT NULL`, `status TEXT NOT NULL` |
-| `tickets` | `id UUID PRIMARY KEY`, `order_id UUID REFERENCES orders(id)`, `seat_id BIGINT UNIQUE REFERENCES seats(id)`, `ticket_code UUID UNIQUE NOT NULL`, `issued_at TIMESTAMPTZ NOT NULL` |
-| `payment_events` | `provider_event_id TEXT PRIMARY KEY`, `payment_id UUID REFERENCES payments(id)`, `received_at TIMESTAMPTZ NOT NULL`; deduplicates successfully processed callbacks. |
-| `outbox` | `id UUID PRIMARY KEY`, `order_id UUID REFERENCES orders(id)`, `kind TEXT NOT NULL`, `payload JSONB NOT NULL`, `published_at TIMESTAMPTZ`, `UNIQUE(order_id, kind)`; records work to publish after a transaction commits. |
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL
+);
 
-All foreign keys above are also `NOT NULL`, except `seats.allocation_order_id`. Restrict deletion of financial records. Use `CHECK` constraints for the allowed order states (`held`, `payment_pending`, `paid`, `expired`, `cancelled`) and seat states (`available`, `held`, `sold`). A seat check requires a NULL allocation for `available`, and a non-NULL allocation for `held` or `sold`.
+CREATE TABLE events (
+  id BIGINT PRIMARY KEY,
+  title TEXT NOT NULL,
+  venue TEXT NOT NULL,
+  starts_at TIMESTAMPTZ NOT NULL,
+  sale_starts_at TIMESTAMPTZ NOT NULL,
+  poster_url TEXT,
+  CHECK (sale_starts_at <= starts_at)
+);
 
-Use a composite foreign key from `(seats.allocation_order_id, seats.event_id)` to `(orders.id, orders.event_id)`, backed by `UNIQUE(orders.id, orders.event_id)`, so a seat cannot be allocated to an order for a different event. Validate selected seats before creating the hold. Create a partial unique index on `orders(user_id, event_id)` where status is `held` or `payment_pending`, enforcing one active checkout per account per event.
+CREATE TABLE orders (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id),
+  event_id BIGINT NOT NULL REFERENCES events(id),
+  status TEXT NOT NULL CHECK (status IN
+    ('held','payment_pending','paid','expired','cancelled')),
+  expires_at TIMESTAMPTZ NOT NULL,
+  total_minor BIGINT NOT NULL CHECK (total_minor >= 0),
+  currency CHAR(3) NOT NULL,
+  request_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (user_id, request_key),
+  UNIQUE (id, event_id)
+);
 
-### Relationships and indexes
+CREATE UNIQUE INDEX one_active_checkout
+  ON orders(user_id, event_id)
+  WHERE status IN ('held','payment_pending');
 
-- A user has many orders; each order belongs to one user.
-- An event has many seats and orders; each seat represents a place at one specific performance.
-- An order allocates one to four seats; each seat has at most one current allocating order. Released seats clear this link.
-- An order has at most one payment intent and many tickets. A ticket belongs to exactly one order and one seat.
-- A payment receives many distinct provider events. An order can have several outbox jobs.
+CREATE TABLE seats (
+  id BIGINT PRIMARY KEY,
+  event_id BIGINT NOT NULL REFERENCES events(id),
+  section TEXT NOT NULL,
+  row_label TEXT NOT NULL,
+  seat_number INTEGER NOT NULL CHECK (seat_number > 0),
+  price_minor BIGINT NOT NULL CHECK (price_minor >= 0),
+  state TEXT NOT NULL CHECK (state IN ('available','held','sold')),
+  allocation_order_id UUID,
+  UNIQUE (event_id, section, row_label, seat_number),
+  UNIQUE (id, allocation_order_id),
+  FOREIGN KEY (allocation_order_id, event_id)
+    REFERENCES orders(id, event_id),
+  CHECK ((state = 'available' AND allocation_order_id IS NULL)
+      OR (state IN ('held','sold') AND allocation_order_id IS NOT NULL))
+);
 
-Index `events(starts_at)`, `seats(event_id, section, state)`, `orders(user_id, created_at)`, and pending expiry times. Primary keys and unique constraints already create supporting unique indexes. The `tickets.seat_id UNIQUE` constraint is a final barrier against issuing two tickets for the same event seat.
+CREATE TABLE payments (
+  id UUID PRIMARY KEY,
+  order_id UUID NOT NULL UNIQUE REFERENCES orders(id),
+  provider_reference TEXT UNIQUE,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  amount_minor BIGINT NOT NULL CHECK (amount_minor >= 0),
+  currency CHAR(3) NOT NULL,
+  status TEXT NOT NULL CHECK (status IN
+    ('pending','succeeded','failed','cancelled','refunded'))
+);
 
-### Holding a seat safely
+CREATE TABLE tickets (
+  id UUID PRIMARY KEY,
+  order_id UUID NOT NULL REFERENCES orders(id),
+  seat_id BIGINT NOT NULL UNIQUE,
+  ticket_code UUID NOT NULL UNIQUE,
+  issued_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (seat_id, order_id)
+    REFERENCES seats(id, allocation_order_id)
+);
 
-A seat-map read followed by an unprotected write is unsafe: two buyers could both see “available”. Instead:
+CREATE TABLE payment_events (
+  provider_event_id TEXT PRIMARY KEY,
+  payment_id UUID NOT NULL REFERENCES payments(id),
+  received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
-1. Authenticate the buyer, validate sale time, admission token and the maximum of four seats.
-2. Start a database transaction. Lock the buyer's `users` row so concurrent requests cannot bypass the account limit; count already purchased seats plus the new selection for this event.
-3. Resolve an existing idempotency key, or insert the held order with a five-minute expiry measured using database time. Lock all requested seat rows in ascending ID order with `SELECT ... FOR UPDATE`.
-4. Check that all requested seats exist, belong to the event and are `available`. If any is unavailable, roll back the whole request and return `409`; do not create a partial hold.
-5. Update all selected seats to `held` with this order ID, save server-calculated prices and commit. The response is sent only after commit.
+CREATE TABLE outbox (
+  id UUID PRIMARY KEY,
+  order_id UUID NOT NULL REFERENCES orders(id),
+  kind TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  published_at TIMESTAMPTZ,
+  UNIQUE (order_id, kind)
+);
 
-For example, if Alice and Brian both request seat 101, Alice's transaction locks its row. Brian waits briefly, or receives a retryable conflict after a short lock timeout. Once Alice commits, Brian sees `held` and cannot overwrite it. If Alice rolls back, Brian may acquire it. This works even when requests reach different app servers.
+CREATE INDEX event_dates ON events(starts_at);
+CREATE INDEX section_inventory ON seats(event_id, section, state);
+CREATE INDEX customer_orders ON orders(user_id, created_at);
+CREATE INDEX expiring_holds ON orders(expires_at) WHERE status = 'held';
+```
 
-### Payment, expiry and failure races
+### Relationships and constraint responsibilities
 
-- To start payment, lock the user row, order row and its seat rows in that order. Confirm ownership, `held` status and an unexpired database timestamp. Change the order to `payment_pending`, create its payment intent and an outbox job in the same transaction. Commit before contacting the provider; never keep database locks open across network requests.
-- A worker creates the provider checkout using the stored payment idempotency key. Retrying after a timeout retrieves the same intent rather than charging again. The API may return a processing state until the checkout URL is ready.
-- A valid success webhook locks the same records, verifies provider state, amount, currency and seat allocation, inserts tickets, marks seats `sold` and the order `paid`, and inserts a receipt outbox job in one transaction. Record the processed provider event in that transaction too. Duplicate callbacks return success without issuing tickets again. Never confirm a purchase from a browser redirect alone.
-- An expiry worker locks the order and seat rows and releases only expired orders still in `held` state. An expiry/payment-start race is resolved by that order lock: either payment starts first or expiry wins. Pending payment seats are not released by the ordinary five-minute expiry worker.
-- Pending payments have a provider checkout deadline. If a callback is lost or the deadline passes, a reconciliation worker queries and, when necessary, cancels the provider intent. Keep seats reserved while the outcome is uncertain. Release them only after a verified terminal failure or cancellation that cannot later succeed. A verified success completes the order. Do not guess that a timeout means failure.
-- If an unexpected late charge arrives after release, do not take a seat from its new owner. Record the anomaly, issue an idempotent refund and alert support. Legal state transitions prevent a late failure callback from changing a paid order.
+- One user has many orders; one event has many orders and seats.
+- An order allocates up to four seats and has at most one payment intent. A released seat clears its allocating order; the expired order remains for audit.
+- One order has many tickets; each seat has at most one ticket because `tickets.seat_id` is unique.
+- Composite foreign keys ensure a seat is allocated within the correct event and a ticket references the seat's actual allocating order.
+- A payment has many distinct provider events. An order has outbox jobs for payment setup and its receipt.
 
-Both the expiry worker and payment handlers lock the order before its seats; seat rows are always locked in ascending ID order. Handlers that need the user lock take it first. This consistent order reduces deadlocks; short lock timeouts and bounded retries handle remaining contention.
+Primary/foreign keys and checks enforce identity, relationships and valid values. Transactional application logic enforces purchase limits and legal state transitions; constraints alone do not implement the complete checkout workflow. Keep financial records rather than cascading their deletion. Use soft deletion where necessary. NoSQL was considered, but relational constraints and transactions fit inventory ownership more directly.
 
-Redis expiry is only a convenience for displays. Database ownership and order state remain authoritative. Cached availability and read replicas must never approve a hold or confirm payment.
+### Atomic hold transaction
+
+A transaction commits all changes together or rolls them all back. PostgreSQL row locks coordinate different app servers:
+
+1. Authenticate, validate event sale time and admission token, and reject duplicate or more than four requested seat IDs.
+2. Begin a transaction and lock the buyer's user row. This serialises their competing purchase requests. Resolve the idempotency key and enforce a maximum of four purchased/actively reserved seats per account for this event.
+3. Create an order with a five-minute deadline using database time. Lock requested seats in ascending ID order:
+
+```sql
+SELECT id, event_id, state, price_minor
+FROM seats
+WHERE id = ANY($1::bigint[])
+ORDER BY id
+FOR UPDATE;
+```
+
+4. Check that the row count matches the selection, all seats belong to the event, and every state is `available`. On any conflict, roll back everything and return `409`.
+5. Update all selected seats to `held` with this order ID, calculate the total from database prices, and commit before responding.
+
+**Race example:** Alice and Brian request seat 101 simultaneously. Alice obtains its row lock. Brian waits briefly. When Alice commits, Brian sees `held` and fails the availability check. If Alice rolls back, Brian can proceed. A stale seat map never grants ownership. Use short lock timeouts and bounded retries; never overwrite a hold after a timeout.
+
+### Payment versus hold expiry
+
+- Payment start locks the user, then order, then seats in ascending ID order. Check ownership, state and expiry using the current database clock after acquiring the order lock. Change `held` to `payment_pending`; create the payment record and payment-setup outbox job atomically.
+- Commit before calling the payment provider. A worker uses the stored provider idempotency key, so retrying a timeout creates no second charge. Never hold database locks during a network call.
+- The expiry worker locks the order, then its seats. It releases only an overdue order still in `held`. Therefore either expiry wins first or payment start wins first; both cannot succeed. Explicit cancellation follows the same locking rule.
+- A verified success callback locks the order and seats, checks the allocation and payment amount/currency, inserts tickets, marks seats `sold` and the order `paid`, and records the processed provider event plus a receipt outbox job in one transaction. Duplicate events do nothing; different success events cannot issue tickets twice because of state checks and `UNIQUE(seat_id)`.
+- Never release `payment_pending` seats merely because five minutes passed. Reconcile with the provider after its checkout deadline. Release only after a verified terminal failure/cancellation that cannot later succeed; retain seats while the outcome is uncertain. A browser redirect is not proof of payment.
+- If an exceptional late charge arrives after safe release, preserve the new seat owner's booking, record the anomaly, refund idempotently and alert support. A late failure callback must never undo a paid order.
+
+All handlers lock an order before its seats; handlers needing the user lock take it first. Only the primary database approves holds and payments. Redis timeouts and replica reads are never inventory authority.
 
 ## 5. Draw the high-level architecture
 
-Start with one application and one relational database. Normal traffic is modest. The big sale adds concentrated reads, competing seat writes and payment delays, which justify the following components.
+Start with one app and one database. The measured sale-time burst justifies adding components with specific responsibilities:
 
 ```mermaid
 flowchart TD
-    U["Browser / mobile user"] --> E["CDN and edge protection"]
-    E --> O["Object storage: posters and static files"]
+    U["Users"] --> E["CDN and edge protection"]
+    E --> S["Object storage"]
     E --> W["Waiting room and admission control"]
     W --> L["Load balancer"]
     L --> A["Stateless app servers"]
-    A --> C["Redis: cached events and seat views"]
+    A --> C["Redis cache"]
     A --> D["PostgreSQL primary and outbox"]
-    D --> R["Read replica / synchronous standby"]
-    D --> B["Outbox dispatcher and job queue"]
-    B --> J["Payment, receipt and reconciliation workers"]
-    J --> D
-    J --> P["Payment provider"]
+    D --> R["Replica / synchronous standby"]
+    D --> Q["Outbox dispatcher and job queue"]
+    Q --> B["Background workers"]
+    B --> D
+    B --> P["Payment provider"]
     P --> H["Signed webhook endpoint"]
     H --> D
-    J --> M["Email service"]
+    B --> M["Email service"]
 ```
 
-### Component explanations
+- **CDN/edge:** serves cached static content and waiting-room updates near users; rate-limits abusive traffic. Do not publicly cache private orders or tickets.
+- **Object storage:** holds event posters and static assets outside the transaction database.
+- **Waiting room:** uses a highly available server-side queue store and signed admission tokens. App servers enforce admission even for direct API calls. Keep queue capacity separate from evictable browsing cache.
+- **Load balancer:** directs requests to healthy instances.
+- **Stateless app servers:** share session state and can scale horizontally; no booking is stored only in one server's memory.
+- **Redis cache:** accelerates event descriptions and section seat views. Use short lifetimes and invalidate changed inventory; stale displays are resolved by transactional holds.
+- **Primary database:** owns inventory and transactions; bound connections and keep transactions short.
+- **Replica/standby:** serves suitable noncritical reads and supports failover. A synchronous standby protects acknowledged commits under its configured failure model. Fence the old writer before promotion; pause checkout until a safe writer exists. Replication does not replace backups.
+- **Outbox/queue:** reliably dispatches committed payment and receipt jobs. If publishing fails, retry the stored outbox entry. Consumers must be idempotent because delivery can repeat.
+- **Workers:** create payment sessions, expire holds, reconcile uncertain payments and send receipts.
+- **Provider/webhook:** processes money externally and confirms it through verified server-to-server messages.
+- **Email:** sends receipts asynchronously. Email failure does not remove a confirmed ticket from the customer's account.
 
-| Component | Why it is needed |
-| --- | --- |
-| CDN and edge protection | Serve HTML, JavaScript, posters and waiting-room updates close to users. Apply request limits and bot checks before traffic reaches checkout. Personalised responses must not enter a shared public cache. |
-| Object storage | Holds large image/static files without filling database storage or using booking database bandwidth. |
-| Waiting room | Keeps most of the 200,000 buyers away from the booking database. Maintain queue state in a highly available server-side store. Validate signed admission tokens at the app; direct API access must not bypass admission. |
-| Load balancer | Routes traffic to healthy app instances and removes unhealthy ones. |
-| Stateless app servers | Run authentication, browsing and booking logic. Keep session/admission state in shared stores so any instance can handle the next request. Scale instances before the advertised sale. |
-| Redis | Cache popular event descriptions and section seat views with short lifetimes; invalidate after inventory changes. It improves speed but does not decide seat ownership. Use separate capacity for queue state so cache pressure cannot evict queue entries. |
-| PostgreSQL primary | Owns orders, payments and inventory; performs all booking transactions. Bound database connections and transaction duration. |
-| Replica / standby | A read replica can serve event metadata; a synchronous standby in another availability zone supports failover without losing acknowledged booking commits under the configured failure model. Fence the old primary before accepting writes on a replacement. Do not use lagging replicas for seat ownership. |
-| Outbox dispatcher and queue | Publish committed jobs reliably. If dispatch fails, the outbox remains available to retry. The queue absorbs bursts of receipts and payment work; consumers deduplicate jobs. |
-| Background workers | Expire abandoned holds, create payment sessions, reconcile uncertain payments and send receipts without blocking browsing. |
-| Payment provider and webhook | Process money externally; authenticated server-to-server confirmation triggers ticket issuance. |
-| Email service | Deliver receipts after confirmation. Email failure does not undo a purchase; tickets remain available in the user's account. |
+### Big-sale operating plan
 
-### Surviving the big sale
+Warm caches and app capacity before opening. Initially trial 100 admitted shoppers per second, with a separate cap on active shoppers; this is a load-test starting point, not proven capacity. Adjust admission using database lock waits, connections, payment throughput and checkout latency. One account gets one active queue entry/admission; a queue place does not guarantee a ticket.
 
-1. Pre-cache event details and posters, warm application capacity and test the database before sales open.
-2. Put the waiting room at the edge. Start with a conservative admission rate, such as 100 newly admitted shoppers per second, then tune it using measured checkout latency, active shoppers, database connections and payment throughput. This is a starting hypothesis, not a proven capacity limit.
-3. Limit active shoppers as well as admissions. Use one queue entry and one active admission per account, an admission window and the four-seat purchase limit. Rate-limit seat refreshes and failed hold attempts. Admission allows a chance to shop; it does not promise a ticket.
-4. Cache section seat views; avoid sending or querying all 20,000 seats on every refresh. The final transactional hold resolves stale displays.
-5. Monitor database lock waits, connection use, hold success rate, queue wait time, payment-pending age, provider errors, outbox backlog, cache hit rate and the 95th-percentile latency. Reduce admission when checkout slows.
-6. Stop new admissions when all seats are sold. If every seat is merely held, pause admissions and explain that more seats may return after expiry.
-7. If Redis caching fails, degrade browsing and reduce admissions rather than sending the entire burst to PostgreSQL. If the queue store fails, pause admissions while preserving order. If the database loses its authoritative writer, pause sales until safe failover completes.
-
-The likely first write bottleneck is contention for popular seat rows and database connections, rather than the normal-day average. More app servers alone cannot remove that contention. Admission control and short transactions protect the primary. Load-test simultaneous requests for the same seat, duplicate callbacks, expired holds and provider timeouts, and confirm that each seat produces at most one ticket.
+Serve section seat maps instead of refreshing all 20,000 seats. Use jitter/back-off for queue updates to avoid synchronised polling. Pause admissions if all stock is held; stop admissions when sold out. Reduce admission during cache failure rather than flooding the database. Pause safely during queue-store failure or uncertain database failover.
 
 ## 6. Discuss bottlenecks and trade-offs
 
-| Choice | Benefit | Cost / alternative considered |
+The first checkout bottleneck is likely competing seat locks and database connections. More app servers cannot remove it; short transactions and admission control can. Monitor queue wait, active shoppers, lock waits, p95 latency, hold conflicts, payment-pending age, provider failures, cache hits and outbox backlog.
+
+| Decision | Benefit | Cost / alternative |
 | --- | --- | --- |
-| Strong database consistency for booking | Prevents double-booking across app instances. | Conflicting requests wait or fail, and checkout pauses during uncertain failover. An eventually consistent inventory store would improve availability but cannot safely make the same booking guarantee without additional coordination. |
-| Waiting room and controlled admission | Protects checkout and gives users a defined queue policy. | Users wait even when app servers have spare capacity. Unrestricted retries feel immediate but favour aggressive clients and can overwhelm the database. |
-| Five-minute seat holds | Gives customers time to pay while preserving their chosen seats. | Abandoned holds temporarily remove stock. Shorter holds improve turnover but disadvantage slower users; longer holds encourage hoarding. Payment-pending holds may last longer while their outcomes are verified. |
-| Cached seat maps | Fast browsing with fewer database reads. | A displayed seat may already be held; only the hold response confirms availability. Reading the primary for every refresh would improve freshness but increase sale-time load. |
-| Single-region primary with standby | Keeps transactions and recovery manageable at this scale. | Distant users have higher write latency and a regional outage can pause sales. Multi-region writers introduce difficult inventory coordination, so they are deferred. |
+| Strong SQL consistency | No duplicate seat ownership. | Conflicting requests wait/fail; sales pause during uncertain failover. Eventual consistency cannot independently promise the same invariant. |
+| Waiting room | Fairer access and bounded database load. | Users wait even with spare browsing capacity; unrestricted retries favour aggressive clients. |
+| Five-minute holds | Time to pay without losing selected seats. | Abandonment hides stock temporarily. Shorter holds improve turnover but disadvantage slower customers. |
+| Cached seat views | Fast browsing and fewer reads. | Availability can be stale; checking the primary on every refresh costs more. |
+| Single-region writer | Simpler transactions and recovery. | Distant users have greater write latency; a regional outage may pause sales. Multi-region writers add inventory coordination complexity. |
 
-### Risks and open questions
+### Validation and remaining risks
 
-Account limits reduce bulk buying but do not fully stop people creating multiple accounts; identity checks must balance fairness, privacy and access. Provider cancellation guarantees and payment deadlines must be confirmed before implementing the release policy. The supplied traffic figures do not reveal instantaneous arrival patterns, real API calls per page, or typical seats per order; production measurements and load tests must refine capacity. Backups and restore drills are still necessary because a replica does not protect against accidental data deletion.
+Test two simultaneous buyers for one seat: exactly one hold succeeds. Test partially overlapping multi-seat selections: no partial order survives. Race payment start against expiry, replay webhooks, retry lost payment responses, and simulate app crashes/provider timeouts. Verify one ticket per seat and no second charge. Load-test the 20,000-arrivals/second edge scenario separately from admitted checkout capacity; the design does not claim those tests have already run.
+
+Multiple fake accounts can still evade account limits. Provider cancellation guarantees, real API requests per page, typical seats per order and instantaneous arrival patterns need confirmation. Run backup-restore and safe-failover drills before a major sale.
+
+**End of complete TicketHub design: sections 1–6 included.**
